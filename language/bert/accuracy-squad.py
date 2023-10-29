@@ -382,7 +382,7 @@ def main():
     parser.add_argument("--out_file", default="build/result/predictions.json",
                         help="Path to output predictions file")
     parser.add_argument("--features_cache_file",
-                        default="eval_features.pickle", help="Path to features' cache file")
+                        default=os.path.expanduser('~/.cache/eval_features.pickle'), help="Path to features' cache file")
     parser.add_argument("--output_transposed",
                         action="store_true", help="Transpose the output")
     parser.add_argument("--output_dtype", default="float32",

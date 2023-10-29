@@ -70,15 +70,15 @@ class BERT_PyTorch_Worker():
     def init_ready(self) -> int:
         return 1
     
-    def issue_queries(self, input_ids: torch.tensor, attention_mask: torch.tensor, token_type_ids: torch.tensor) -> np.array:
+    def issue_queries(self, input_ids: torch.tensor, attention_mask: torch.tensor, token_type_ids: torch.tensor) -> torch.tensor:
         with torch.no_grad():
-            input_ids = input_ids.to(self.dev)
-            attention_mask = attention_mask.to(self.dev)
-            token_type_ids = token_type_ids.to(self.dev)
+            input_ids = input_ids.to(torch.int32).to(self.dev)
+            attention_mask = attention_mask.to(torch.int32).to(self.dev)
+            token_type_ids = token_type_ids.to(torch.int32).to(self.dev)
             model_output = self.model.forward(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
             start_scores = model_output.start_logits
             end_scores = model_output.end_logits
-            output = torch.stack([start_scores, end_scores], axis=-1).cpu().numpy()
+            output = torch.stack([start_scores, end_scores], axis=-1).to(torch.float16).cpu()
             return output
 
 
@@ -129,9 +129,11 @@ class BERT_PyTorch_SUT():
             attention_mask.append(eval_features.input_mask)
             token_type_ids.append(eval_features.segment_ids)
         
-        input_ids = torch.tensor(input_ids, dtype=torch.int64)
-        attention_mask = torch.tensor(attention_mask, dtype=torch.int64)
-        token_type_ids = torch.tensor(token_type_ids, dtype=torch.int64)
+        # Here we convert those tensors to int16 and int8 to save network BW
+        # After receiving the tensors, we convert them back to int32
+        input_ids = torch.tensor(input_ids, dtype=torch.int16)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.int8)
+        token_type_ids = torch.tensor(token_type_ids, dtype=torch.int8)
 
         input_ids = torch.tensor_split(input_ids, num_gpus)
         attention_mask = torch.tensor_split(attention_mask, num_gpus)
@@ -144,10 +146,10 @@ class BERT_PyTorch_SUT():
         for worker_id in range(len(self.workers)):
             handler = self.workers[worker_id].issue_queries.remote(input_ids[worker_id], attention_mask[worker_id], token_type_ids[worker_id])
             model_output_handlers.append(handler)
-        model_output = ray.get(model_output_handlers)
+        model_outputs = ray.get(model_output_handlers)
         forward_time_end = time.time()
 
-        output = np.concatenate(model_output, axis=0)
+        output = np.concatenate([x.to(torch.float32).numpy() for x in model_outputs], axis=0)
 
         submit_time_start = time.time()
 

@@ -49,6 +49,7 @@ from transformers import BertConfig, BertForQuestionAnswering, MobileBertForQues
 from squad_QSL import get_squad_QSL
 
 num_gpus = 4
+max_query_per_batch = 4096
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
 # model_name = 'yujiepan/internal.mobilebert-uncased-12blks-squadv1-int8-quantize-embedding'
@@ -109,9 +110,27 @@ class BERT_PyTorch_Worker():
             attention_mask = torch.tensor(attention_mask, dtype=torch.int32, device=self.dev)
             token_type_ids = torch.tensor(token_type_ids, dtype=torch.int32, device=self.dev)
 
-            model_output = self.model.forward(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-            start_scores = model_output.start_logits
-            end_scores = model_output.end_logits
+            num_queries = len(indexes)
+            num_batches = (num_queries + max_query_per_batch - 1) // max_query_per_batch
+            start_scores = []
+            end_scores = []
+
+            for batch_index in range(num_batches):
+                batch_start_index = batch_index * max_query_per_batch
+                batch_end_index = min((batch_index + 1) * max_query_per_batch, num_queries)
+                model_output = self.model.forward(
+                    input_ids = input_ids[batch_start_index:batch_end_index],
+                    attention_mask = attention_mask[batch_start_index:batch_end_index],
+                    token_type_ids = token_type_ids[batch_start_index:batch_end_index]
+                )
+                batch_start_scores = model_output.start_logits
+                batch_end_scores = model_output.end_logits
+                start_scores.append(batch_start_scores)
+                end_scores.append(batch_end_scores)
+            
+            start_scores = torch.cat(start_scores, dim=0)
+            end_scores = torch.cat(end_scores, dim=0)
+
             output = torch.stack([start_scores, end_scores], axis=-1).to(torch.float16).cpu()   # We send float16 to save network bandwidth
             return output
 
@@ -160,7 +179,8 @@ class BERT_PyTorch_SUT():
         forward_time_start = time.time()
         model_output_handlers = []
         for worker_id in range(len(self.workers)):
-            handler = self.workers[worker_id].issue_queries.remote(indexes[worker_id::num_gpus])
+            num_queries_per_worker = (num_query_samples+len(self.workers)-1) // len(self.workers)
+            handler = self.workers[worker_id].issue_queries.remote(indexes[worker_id*num_queries_per_worker:(worker_id+1)*num_queries_per_worker])
             model_output_handlers.append(handler)
         model_outputs = ray.get(model_output_handlers)
         forward_time_end = time.time()

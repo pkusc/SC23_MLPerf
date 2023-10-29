@@ -54,51 +54,23 @@ class BERT_ONNXRuntime_SUT():
         self.qsl = get_squad_QSL(args.max_examples)
 
     def issue_queries(self, query_samples):
-        input_ids = np.empty((0, 384), np.int64)
-        input_mask = np.empty((0, 384), np.int64)     # = attention_mask when quantized=True
-        segment_ids = np.empty((0, 384), np.int64)    # = token_type_ids when quantized=True
         for i in range(len(query_samples)):
             eval_features = self.qsl.get_features(query_samples[i].index)
-            input_ids = np.vstack((input_ids, np.array(eval_features.input_ids).astype(np.int64)))
-            input_mask = np.vstack((input_mask, np.array(eval_features.input_mask).astype(np.int64)))
-            segment_ids = np.vstack((segment_ids, np.array(eval_features.segment_ids).astype(np.int64)))
-            # if self.quantized:
-            #     fd = {
-            #         "input_ids": np.array(eval_features.input_ids).astype(np.int64)[np.newaxis, :],
-            #         "attention_mask": np.array(eval_features.input_mask).astype(np.int64)[np.newaxis, :],
-            #         "token_type_ids": np.array(eval_features.segment_ids).astype(np.int64)[np.newaxis, :]
-            #     }
-            # else:
-            #     fd = {
-            #         "input_ids": np.array(eval_features.input_ids).astype(np.int64)[np.newaxis, :],
-            #         "input_mask": np.array(eval_features.input_mask).astype(np.int64)[np.newaxis, :],
-            #         "segment_ids": np.array(eval_features.segment_ids).astype(np.int64)[np.newaxis, :]
-            #     }
-                # print(fd)
-        # input = np.array(input)
-        print(input_ids)
-        print(input_mask)
-        print(segment_ids)
+            if self.quantized:
+                fd = {
+                    "input_ids": np.array(eval_features.input_ids).astype(np.int64)[np.newaxis, :],
+                    "attention_mask": np.array(eval_features.input_mask).astype(np.int64)[np.newaxis, :],
+                    "token_type_ids": np.array(eval_features.segment_ids).astype(np.int64)[np.newaxis, :]
+                }
+            else:
+                fd = {
+                    "input_ids": np.array(eval_features.input_ids).astype(np.int64)[np.newaxis, :],
+                    "input_mask": np.array(eval_features.input_mask).astype(np.int64)[np.newaxis, :],
+                    "segment_ids": np.array(eval_features.segment_ids).astype(np.int64)[np.newaxis, :]
+                }
+            scores = self.sess.run([o.name for o in self.sess.get_outputs()], fd)
+            output = np.stack(scores, axis=-1)[0]
 
-        if self.quantized:
-            fd = {
-                "input_ids": input_ids,
-                "attention_mask": input_mask,
-                "token_type_ids": segment_ids
-            }
-        else:
-            fd = {
-                "input_ids": input_ids,
-                "input_mask": input_mask,
-                "segment_ids": segment_ids
-            }
-
-        scores = self.sess.run([o.name for o in self.sess.get_outputs()], fd)
-        outputs = np.stack(scores, axis=-1)
-        print(outputs)
-
-        for i in range(len(query_samples)):
-            output = outputs[i]
             response_array = array.array("B", output.tobytes())
             bi = response_array.buffer_info()
             response = lg.QuerySampleResponse(query_samples[i].id, bi[0], bi[1])

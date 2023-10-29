@@ -48,8 +48,8 @@ import transformers
 from transformers import BertConfig, BertForQuestionAnswering, MobileBertForQuestionAnswering
 from squad_QSL import get_squad_QSL
 
-num_gpus = 4
-max_query_per_batch = 4096
+num_gpus = 2
+max_query_per_batch = 8192
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
 # model_name = 'yujiepan/internal.mobilebert-uncased-12blks-squadv1-int8-quantize-embedding'
@@ -85,7 +85,7 @@ class BERT_PyTorch_Worker():
             os.environ["http_proxy"] = proxy_addr
             os.environ["https_proxy"] = proxy_addr
             os.environ["all_proxy"] = proxy_addr
-            self.model = MobileBertForQuestionAnswering.from_pretrained(model_name)
+            self.model = MobileBertForQuestionAnswering.from_pretrained(model_name).to(torch.float16)
             self.model.to(self.dev)
         
         # Initialize QSL (Query Sample Library)
@@ -199,6 +199,7 @@ class BERT_PyTorch_SUT():
         print(f"Time to load data: {str(load_data_end_time - load_data_start_time)} s")
         print(f"Time to forward: {str(forward_time_end - forward_time_start)} s")
         print(f"Time to submit: {str(submit_time_end - submit_time_start)} s")
+        print(f"Estimated QPS: {str(num_query_samples / (submit_time_end - load_data_start_time))}")
 
     def flush_queries(self):
         pass

@@ -48,8 +48,8 @@ import transformers
 from transformers import BertConfig, BertForQuestionAnswering, MobileBertForQuestionAnswering
 from squad_QSL import get_squad_QSL
 
-num_gpus = 2
-max_query_per_batch = 8192
+num_gpus = 1
+max_query_per_batch = 16384
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
 # model_name = 'yujiepan/internal.mobilebert-uncased-12blks-squadv1-int8-quantize-embedding'
@@ -59,6 +59,13 @@ max_query_per_batch = 8192
 # model_name = 'neuralmagic/mobilebert-uncased-finetuned-squadv1'
 model_name = 'csarron/mobilebert-uncased-squad-v1'
 # model_name = 'google/mobilebert-uncased'
+
+# For auto-testing on different models
+if os.environ.get("INTLSYS_SCRIPT_MODEL_NAME", None) is not None:
+    model_name = os.environ.get("INTLSYS_SCRIPT_MODEL_NAME")
+    cast_to_fp16 = False
+else:
+    cast_to_fp16 = True
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class BERT_PyTorch_Worker():
@@ -85,7 +92,9 @@ class BERT_PyTorch_Worker():
             os.environ["http_proxy"] = proxy_addr
             os.environ["https_proxy"] = proxy_addr
             os.environ["all_proxy"] = proxy_addr
-            self.model = MobileBertForQuestionAnswering.from_pretrained(model_name).to(torch.float16)
+            self.model = MobileBertForQuestionAnswering.from_pretrained(model_name)
+            if cast_to_fp16:
+                self.model = self.model.to(torch.float16)
             self.model.to(self.dev)
         
         # Initialize QSL (Query Sample Library)

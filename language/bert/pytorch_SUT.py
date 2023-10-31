@@ -14,17 +14,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import array
 import json
 import os
 import sys
 import time
-import ray
+import pickle
 from typing import List
 sys.path.insert(0, os.path.join(os.getcwd(), "DeepLearningExamples", "PyTorch", "LanguageModeling", "BERT"))
 sys.path.insert(0, os.getcwd())
 
+import ray
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+proxy_addr = "http://10.129.196.146:20171"
 loadgen_path = "/home/intlsy/CM/repos/local/cache/fa9180d70a5e4e1f/"
 inference_bert_path = "/home/intlsy/CM/repos/local/cache/8e90af0a933b4703/inference/language/bert"
 
@@ -36,6 +44,10 @@ ray.init(runtime_env = {
         "PYTHONPATH": os.path.join(loadgen_path, 'install', 'python'),
         "C_INCLUDE_PATH": os.path.join(loadgen_path, 'install', 'include'),
         "CPLUS_INCLUDE_PATH": os.path.join(loadgen_path, 'install', 'include'),
+        "http_proxy": proxy_addr,
+        "https_proxy": proxy_addr,
+        "all_proxy": proxy_addr,
+        "NM_DISABLE_ANALYTICS": "1",
     }
 })
 
@@ -47,9 +59,23 @@ import torch
 import transformers
 from transformers import BertConfig, BertForQuestionAnswering, MobileBertForQuestionAnswering
 from squad_QSL import get_squad_QSL
+from squad_QSL_deepsparse import get_squad_QSL_deepsparse
 
-num_gpus = 4
-max_query_per_batch = 16384
+from deepsparse import Engine, Scheduler
+from deepsparse.utils import generate_random_inputs, model_to_path, override_onnx_input_shapes
+
+MAX_SEQ_LEN = 384
+
+num_deepsparse_workers = 2
+deepsparse_worker_max_batchsize = 128
+deepsparse_model_path = '/home/intlsy/.cache/sparsezoo/2088879f-4211-4c25-8a70-daf64d43c6ca/model.onnx'
+num_cpus_per_deepsparse_worker = 56
+
+num_pytorch_workers = 4
+pytorch_worker_max_batchsize = 16384
+
+deepsparse_pytorch_work_ratio = 700 / 2400
+
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
 # model_name = 'yujiepan/internal.mobilebert-uncased-12blks-squadv1-int8-quantize-embedding'
@@ -67,7 +93,97 @@ if os.environ.get("INTLSYS_SCRIPT_MODEL_NAME", None) is not None:
 else:
     cast_to_fp16 = True
 
-@ray.remote(num_cpus=16, num_gpus=1)
+@ray.remote(num_cpus=num_cpus_per_deepsparse_worker)
+class BERT_DeepSparse_Worker():
+    def __init__(self, worker_id, bert_config, max_examples: int):
+        print(f"Worker {worker_id} initializing")
+        self.worker_id = worker_id
+        self.model_path = deepsparse_model_path
+        self.batch_size = deepsparse_worker_max_batchsize
+        self.scenario = "Offline"
+        self.max_examples = max_examples
+        self.sequence_lengths = [MAX_SEQ_LEN]
+        print(f"Worker {self.worker_id} initialized")
+    
+    def load_engine(self):
+        print(f"Worker {self.worker_id} loading engine...")
+        def scenario_to_scheduler(scenario):
+            if scenario == "SingleStream":
+                return Scheduler.single_stream
+            elif scenario == "MultiStream":
+                return Scheduler.single_stream
+            elif scenario == "Offline":
+                return Scheduler.single_stream
+            elif scenario == "Server":
+                return Scheduler.multi_stream
+            else:
+                raise Exception(scenario)
+            
+        os.environ["NM_BIND_THREADS_TO_CORES"] = "1"
+
+        os.chdir(inference_bert_path)   # We chdir() here or the QSL cannot find the vocabuary path
+        self.qsl = get_squad_QSL_deepsparse(total_count_override=self.max_examples, unpadding_lengths=self.sequence_lengths)
+
+        print(f"Creating engine for seq_len={MAX_SEQ_LEN} and batch_size={self.batch_size}...")
+        self.engine = Engine(
+            deepsparse_model_path,
+            batch_size=self.batch_size,
+            scheduler=scenario_to_scheduler(self.scenario),
+            input_shapes=[[self.batch_size, MAX_SEQ_LEN]],
+            num_cores=num_cpus_per_deepsparse_worker
+        )
+
+        print("Warming up engine...")
+        with override_onnx_input_shapes(self.model_path, input_shapes=[[self.batch_size, MAX_SEQ_LEN]]) as model_path:
+            warmup_inputs = generate_random_inputs(model_path, self.batch_size)
+            for i in range(5):
+                self.engine.run(warmup_inputs, val_inp=False)
+
+    def init_ready(self) -> int:
+        return 1
+    
+    def issue_queries(self, indexes: List[int]) -> torch.tensor:
+        def pad_to_batch(x):
+            x_pad = np.pad(x, ((0,self.batch_size-x.shape[0]), (0,0)))
+            return x_pad
+        def process_batch(batched_features):
+            pad_func = lambda x: pad_to_batch(x) if len(batched_features) != self.batch_size else x
+            fd = [
+                pad_func(np.stack(
+                    np.asarray([f.unpadded_input_ids for f in batched_features]).astype(np.int64)[np.newaxis, :])[0, :, :]),
+                pad_func(np.stack(
+                    np.asarray([f.unpadded_input_mask for f in batched_features]).astype(np.int64)[np.newaxis, :])[0, :, :]),
+                pad_func(np.stack(
+                    np.asarray([f.unpadded_segment_ids for f in batched_features]).astype(np.int64)[np.newaxis, :])[0, :, ])
+            ]
+            return fd
+        def batched_list(lst, n):
+            """Yield successive n-sized chunks from lst, with the last possibly short."""
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        # Extract features from queries and split into buckets
+        input_features = [
+            self.qsl.get_features(index) for index in indexes
+        ]
+        print(f"({time.time()}) Input generated")
+
+        result = []
+        for batched_features in batched_list(input_features, self.batch_size):
+            unpadded_batch_size = len(batched_features)
+            fd = process_batch(batched_features)
+
+            scores = self.engine.run(fd, val_inp=False)
+
+            output = np.stack(scores, axis=-1)  # (batch_size, seq_len, 2)
+            assert output.shape[1] == MAX_SEQ_LEN
+
+            result.extend(output[:unpadded_batch_size])
+        result = np.stack(result, axis=0)
+        
+        return result
+                
+@ray.remote(num_cpus=2, num_gpus=1)
 class BERT_PyTorch_Worker():
     def __init__(self, worker_id, bert_config, max_examples: int):
         self.worker_id = worker_id
@@ -89,7 +205,6 @@ class BERT_PyTorch_Worker():
             # Thanks Yuanhang Sun for the proxy!
             # Fuck GFW.
             # proxy_addr = "http://115.27.161.58:7890"
-            proxy_addr = "http://10.129.196.146:20171"
             os.environ["http_proxy"] = proxy_addr
             os.environ["https_proxy"] = proxy_addr
             os.environ["all_proxy"] = proxy_addr
@@ -127,14 +242,14 @@ class BERT_PyTorch_Worker():
             attention_mask_prefix_lens = torch.tensor(attention_mask_prefix_lens, dtype=torch.int32, device=self.dev)
             print(f"({time.time()}) Input generated")
 
-            num_batches = (num_queries + max_query_per_batch - 1) // max_query_per_batch
+            num_batches = (num_queries + pytorch_worker_max_batchsize - 1) // pytorch_worker_max_batchsize
             start_scores = []
             end_scores = []
 
             for batch_index in range(num_batches):
                 print(f"({time.time()}) Worker {self.worker_id} processing batch {batch_index}...")
-                batch_start_index = batch_index * max_query_per_batch
-                batch_end_index = min((batch_index + 1) * max_query_per_batch, num_queries)
+                batch_start_index = batch_index * pytorch_worker_max_batchsize
+                batch_end_index = min((batch_index + 1) * pytorch_worker_max_batchsize, num_queries)
                 model_output = self.model.forward(
                     input_ids = input_ids[batch_start_index:batch_end_index],
                     attention_mask_prefix_lens = attention_mask_prefix_lens[batch_start_index:batch_end_index],
@@ -173,11 +288,41 @@ class BERT_PyTorch_SUT():
             vocab_size=config_json["vocab_size"])
         
         # Initialize workers
-        self.workers = []
-        for i in range(num_gpus):
-            self.workers.append(BERT_PyTorch_Worker.remote(i, bert_config, args.max_examples))
-        for worker in self.workers:
+        print("Begin to create workers")
+        if num_deepsparse_workers != 0:
+            pg = placement_group(
+                [{"CPU": num_cpus_per_deepsparse_worker}]*num_deepsparse_workers,
+                strategy="STRICT_SPREAD"
+            )
+            ray.get(pg.ready())
+
+            self.deepsparse_workers = []
+            for i in range(num_deepsparse_workers):
+                self.deepsparse_workers.append(
+                    BERT_DeepSparse_Worker.options(
+                        scheduling_strategy = PlacementGroupSchedulingStrategy(
+                            placement_group = pg,
+                            placement_group_bundle_index=i
+                        )
+                    ).remote(i, bert_config, args.max_examples)
+                )
+            # for worker in self.deepsparse_workers:
+                # ray.get(worker.init_ready.remote())
+
+            handlers = []
+            for worker in self.deepsparse_workers:
+                handlers.append(worker.load_engine.remote())
+            ray.get(handlers)
+        else:
+            self.deepsparse_workers = []
+
+        self.pytorch_workers = []
+        for i in range(num_pytorch_workers):
+            self.pytorch_workers.append(BERT_PyTorch_Worker.remote(i, bert_config, args.max_examples))
+        for worker in self.pytorch_workers:
             ray.get(worker.init_ready.remote())
+        
+        self.workers = self.deepsparse_workers + self.pytorch_workers
 
         # Initialize SUT (System Under Test)
         self.sut = lg.ConstructSUT(self.issue_queries, self.flush_queries)
@@ -194,12 +339,21 @@ class BERT_PyTorch_SUT():
             indexes.append(query_samples[i].index)
         load_data_end_time = time.time()
 
+        total_load_frac = deepsparse_pytorch_work_ratio*num_deepsparse_workers + num_pytorch_workers
+        deepsparse_worker_load = int((deepsparse_pytorch_work_ratio / total_load_frac) * num_query_samples)
+        pytorch_worker_load = int((1.0 / total_load_frac) * num_query_samples)
+        worker_loads = [deepsparse_worker_load] * num_deepsparse_workers + [pytorch_worker_load] * num_pytorch_workers
+        worker_loads[-1] += num_query_samples - sum(worker_loads)
+        print(worker_loads)
+        
         forward_time_start = time.time()
         model_output_handlers = []
+        work_start_index = 0
         for worker_id in range(len(self.workers)):
-            num_queries_per_worker = (num_query_samples+len(self.workers)-1) // len(self.workers)
-            handler = self.workers[worker_id].issue_queries.remote(indexes[worker_id*num_queries_per_worker:(worker_id+1)*num_queries_per_worker])
+            cur_worker_load = worker_loads[worker_id]
+            handler = self.workers[worker_id].issue_queries.remote(indexes[work_start_index:work_start_index+cur_worker_load])
             model_output_handlers.append(handler)
+            work_start_index += cur_worker_load
         model_outputs = ray.get(model_output_handlers)
         forward_time_end = time.time()
 

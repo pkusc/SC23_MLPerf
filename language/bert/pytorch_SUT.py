@@ -48,7 +48,7 @@ import transformers
 from transformers import BertConfig, BertForQuestionAnswering, MobileBertForQuestionAnswering
 from squad_QSL import get_squad_QSL
 
-num_gpus = 1
+num_gpus = 4
 max_query_per_batch = 16384
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
@@ -67,9 +67,10 @@ if os.environ.get("INTLSYS_SCRIPT_MODEL_NAME", None) is not None:
 else:
     cast_to_fp16 = True
 
-@ray.remote(num_cpus=1, num_gpus=1)
+@ray.remote(num_cpus=16, num_gpus=1)
 class BERT_PyTorch_Worker():
     def __init__(self, worker_id, bert_config, max_examples: int):
+        self.worker_id = worker_id
         torch.cuda.set_device(0)
         print(f"Initializing worker {worker_id} on GPU {torch.cuda.get_device_name()}")
         self.dev = torch.device("cuda:0")
@@ -99,37 +100,44 @@ class BERT_PyTorch_Worker():
         
         # Initialize QSL (Query Sample Library)
         self.qsl = get_squad_QSL(max_examples)
+
+        for index in range(len(self.qsl.eval_features)):
+            self.qsl.eval_features[index].input_ids = torch.tensor(self.qsl.eval_features[index].input_ids, device=self.dev, dtype=torch.int32)
+            self.qsl.eval_features[index].segment_ids = torch.tensor(self.qsl.eval_features[index].segment_ids, device=self.dev, dtype=torch.int32)
     
     def init_ready(self) -> int:
         return 1
     
     def issue_queries(self, indexes: List[int]) -> torch.tensor:
+        print(f"({time.time()}) Task received")
         with torch.no_grad():
-            input_ids = []
-            attention_mask = []
-            token_type_ids = []
-
-            for index in indexes:
-                eval_features = self.qsl.get_features(index)
-                input_ids.append(eval_features.input_ids)
-                attention_mask.append(eval_features.input_mask)
-                token_type_ids.append(eval_features.segment_ids)
-            
-            input_ids = torch.tensor(input_ids, dtype=torch.int32, device=self.dev)
-            attention_mask = torch.tensor(attention_mask, dtype=torch.int32, device=self.dev)
-            token_type_ids = torch.tensor(token_type_ids, dtype=torch.int32, device=self.dev)
-
             num_queries = len(indexes)
+            hidden_size = 384
+
+            input_ids = torch.empty((num_queries, hidden_size), device=self.dev, dtype=torch.int32)
+            token_type_ids = torch.empty((num_queries, hidden_size), device=self.dev, dtype=torch.int32)
+            attention_mask_prefix_lens = []
+
+            for i, index in enumerate(indexes):
+                eval_features = self.qsl.get_features(index)
+                input_ids[i] = eval_features.input_ids
+                token_type_ids[i] = eval_features.segment_ids
+                attention_mask_prefix_lens.append(sum(eval_features.input_mask))
+
+            attention_mask_prefix_lens = torch.tensor(attention_mask_prefix_lens, dtype=torch.int32, device=self.dev)
+            print(f"({time.time()}) Input generated")
+
             num_batches = (num_queries + max_query_per_batch - 1) // max_query_per_batch
             start_scores = []
             end_scores = []
 
             for batch_index in range(num_batches):
+                print(f"({time.time()}) Worker {self.worker_id} processing batch {batch_index}...")
                 batch_start_index = batch_index * max_query_per_batch
                 batch_end_index = min((batch_index + 1) * max_query_per_batch, num_queries)
                 model_output = self.model.forward(
                     input_ids = input_ids[batch_start_index:batch_end_index],
-                    attention_mask = attention_mask[batch_start_index:batch_end_index],
+                    attention_mask_prefix_lens = attention_mask_prefix_lens[batch_start_index:batch_end_index],
                     token_type_ids = token_type_ids[batch_start_index:batch_end_index]
                 )
                 batch_start_scores = model_output.start_logits
@@ -140,7 +148,7 @@ class BERT_PyTorch_Worker():
             start_scores = torch.cat(start_scores, dim=0)
             end_scores = torch.cat(end_scores, dim=0)
 
-            output = torch.stack([start_scores, end_scores], axis=-1).to(torch.float16).cpu()   # We send float16 to save network bandwidth
+            output = torch.stack([start_scores, end_scores], axis=-1).cpu().numpy()
             return output
 
 
@@ -177,6 +185,7 @@ class BERT_PyTorch_SUT():
         self.qsl = get_squad_QSL(args.max_examples)
 
     def issue_queries(self, query_samples):
+        print(f"({time.time()}) Test starts")
         num_query_samples = len(query_samples)
 
         load_data_start_time = time.time()
@@ -194,7 +203,7 @@ class BERT_PyTorch_SUT():
         model_outputs = ray.get(model_output_handlers)
         forward_time_end = time.time()
 
-        output = np.concatenate([x.to(torch.float32).numpy() for x in model_outputs], axis=0)
+        output = np.concatenate(model_outputs, axis=0).astype(np.float32)
 
         submit_time_start = time.time()
 

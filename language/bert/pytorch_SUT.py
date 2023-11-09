@@ -74,7 +74,7 @@ num_cpus_per_deepsparse_worker = 56
 num_pytorch_workers = 4
 pytorch_worker_max_batchsize = 16384
 
-deepsparse_pytorch_work_ratio = 700 / 2400
+deepsparse_pytorch_work_ratio = 650 / 2300
 
 # model_name = 'origin_pytorch_model'
 # model_name = 'mrm8488/mobilebert-uncased-finetuned-squadv1'
@@ -181,6 +181,8 @@ class BERT_DeepSparse_Worker():
             result.extend(output[:unpadded_batch_size])
         result = np.stack(result, axis=0)
         
+        print(f"({time.time()}) Result generated")
+
         return result
                 
 @ray.remote(num_cpus=2, num_gpus=1)
@@ -264,6 +266,7 @@ class BERT_PyTorch_Worker():
             end_scores = torch.cat(end_scores, dim=0)
 
             output = torch.stack([start_scores, end_scores], axis=-1).cpu().numpy()
+            print(f"({time.time()}) Result generated")
             return output
 
 
@@ -306,8 +309,6 @@ class BERT_PyTorch_SUT():
                         )
                     ).remote(i, bert_config, args.max_examples)
                 )
-            # for worker in self.deepsparse_workers:
-                # ray.get(worker.init_ready.remote())
 
             handlers = []
             for worker in self.deepsparse_workers:
@@ -322,7 +323,7 @@ class BERT_PyTorch_SUT():
         for worker in self.pytorch_workers:
             ray.get(worker.init_ready.remote())
         
-        self.workers = self.deepsparse_workers + self.pytorch_workers
+        self.workers = self.pytorch_workers + self.deepsparse_workers
 
         # Initialize SUT (System Under Test)
         self.sut = lg.ConstructSUT(self.issue_queries, self.flush_queries)
@@ -342,9 +343,9 @@ class BERT_PyTorch_SUT():
         total_load_frac = deepsparse_pytorch_work_ratio*num_deepsparse_workers + num_pytorch_workers
         deepsparse_worker_load = int((deepsparse_pytorch_work_ratio / total_load_frac) * num_query_samples)
         pytorch_worker_load = int((1.0 / total_load_frac) * num_query_samples)
-        worker_loads = [deepsparse_worker_load] * num_deepsparse_workers + [pytorch_worker_load] * num_pytorch_workers
-        worker_loads[-1] += num_query_samples - sum(worker_loads)
-        print(worker_loads)
+        worker_loads = [pytorch_worker_load] * num_pytorch_workers + [deepsparse_worker_load] * num_deepsparse_workers
+        worker_loads[0] += num_query_samples - sum(worker_loads)
+        print(f"Worker loads: {worker_loads}")
         
         forward_time_start = time.time()
         model_output_handlers = []
